@@ -2,11 +2,20 @@ package com.example.demo;
 
 import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker.State;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.micrometer.tagged.TaggedCircuitBreakerMetrics;
+import io.github.resilience4j.micrometer.tagged.TaggedRateLimiterMetrics;
+import io.github.resilience4j.micrometer.tagged.TaggedTimeLimiterMetrics;
+import io.github.resilience4j.ratelimiter.RateLimiter;
+import io.github.resilience4j.ratelimiter.RateLimiterConfig;
+import io.github.resilience4j.ratelimiter.RateLimiterRegistry;
+import io.github.resilience4j.ratelimiter.RequestNotPermitted;
 import io.github.resilience4j.timelimiter.TimeLimiter;
 import io.github.resilience4j.timelimiter.TimeLimiterConfig;
 import io.github.resilience4j.timelimiter.TimeLimiterRegistry;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.vavr.control.Try;
 import java.time.Duration;
 import java.util.Arrays;
@@ -19,6 +28,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 import javax.annotation.PostConstruct;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 /**
@@ -32,11 +42,18 @@ public class HelloService {
 
     private CircuitBreaker circuitBreaker;
 
+    private RateLimiter rateLimiter;
+
+    @Autowired
+    private MeterRegistry meterRegistry;
+
     @PostConstruct
     public void init() {
         TimeLimiterRegistry timeLimiterRegistry = TimeLimiterRegistry.of(
                 TimeLimiterConfig.custom()
+                        // 当超时时是否关闭取消线程
                         .cancelRunningFuture(true)
+                        // 超时时间
                         .timeoutDuration(Duration.ofMillis(300))
                         .build()
         );
@@ -55,6 +72,24 @@ public class HelloService {
                 .build();
         CircuitBreakerRegistry circuitBreakerRegistry = CircuitBreakerRegistry.of(circuitBreakerConfig);
         circuitBreaker = circuitBreakerRegistry.circuitBreaker("Hello-CircuitBreaker");
+
+        RateLimiterConfig rateLimiterConfig = RateLimiterConfig.custom()
+                // 时间区间内允许的最多调用数
+                .limitForPeriod(8)
+                // 时间区间大小
+                .limitRefreshPeriod(Duration.ofSeconds(1))
+                // 线程等待时间（0 就是直接拒绝）
+                .timeoutDuration(Duration.ZERO)
+                .build();
+        RateLimiterRegistry rateLimiterRegistry = RateLimiterRegistry.of(rateLimiterConfig);
+        rateLimiter = rateLimiterRegistry.rateLimiter("Hello-RateLimiter");
+
+        TaggedCircuitBreakerMetrics.ofCircuitBreakerRegistry(circuitBreakerRegistry)
+                .bindTo(meterRegistry);
+        TaggedRateLimiterMetrics.ofRateLimiterRegistry(rateLimiterRegistry)
+                .bindTo(meterRegistry);
+        TaggedTimeLimiterMetrics.ofTimeLimiterRegistry(timeLimiterRegistry)
+                .bindTo(meterRegistry);
     }
 
     private String sayHello(int time) {
@@ -65,17 +100,23 @@ public class HelloService {
         return "hello";
     }
 
-    public String sayHelloLimit(int time) throws Exception {
-        // 创建单线程的线程池
+    public String sayHelloLimit(int time) {
+        State state = circuitBreaker.getState();
+        // 创建单线程的线程池（用于超时控制）
         ExecutorService pool = Executors.newSingleThreadExecutor();
         // 将被保护方法包装为能够返回Future的supplier函数
         Supplier<Future<String>> futureSupplier = () -> pool.submit(() -> sayHello(time));
         Callable<String> restrictedCallable = TimeLimiter.decorateFutureSupplier(timeLimiter, futureSupplier);
         Callable<String> chainedCallable = CircuitBreaker.decorateCallable(circuitBreaker, restrictedCallable);
+        chainedCallable = RateLimiter.decorateCallable(rateLimiter, chainedCallable);
         Try<String> result = Try.ofCallable(chainedCallable)
-                .recover(CallNotPermittedException.class, throwable -> time + " Fallback:" + circuitBreaker.getState())
-                .recover(TimeoutException.class, throwable -> time + " Fallback: Timeout " + circuitBreaker.getState())
-                .recover(throwable -> time + " Fallback: unknown");
+                .recover(CallNotPermittedException.class,
+                        throwable -> time + " Fallback:" + state + "->" + circuitBreaker.getState())
+                .recover(TimeoutException.class,
+                        throwable -> time + " Fallback: Timeout " + state + "->" + circuitBreaker.getState())
+                .recover(RequestNotPermitted.class,
+                        throwable -> time + " Fallback: RateLimit " + state + "->" + circuitBreaker.getState())
+                .recover(throwable -> time + " Fallback: " + throwable.getClass());
 
         return result.get();
     }
